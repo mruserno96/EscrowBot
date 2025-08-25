@@ -1,7 +1,8 @@
-import logging import sqlite3 from telegram import Update, ReplyKeyboardMarkup from telegram.ext import ( Application, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters, )
+import logging import sqlite3 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton from telegram.ext import ( Application, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, CallbackQueryHandler, filters, )
 
 ================= CONFIG =================
-BOT_TOKEN = "8051955868:AAFXhrj69_sNA2Riw-1qyQjVwG1dA2T6qHo" ADMIN_ID = 7357160729 # replace with your Telegram ID USDT_ADDRESS = "YOUR_USDT_ADDRESS"
+
+BOT_TOKEN = "8051955868:AAFXhrj69_sNA2Riw-1qyQjVwG1dA2T6qHo" ADMIN_ID = 7357160729  # replace with your Telegram ID USDT_ADDRESS = "YOUR_USDT_ADDRESS"
 
 DB setup
 
@@ -17,9 +18,9 @@ ASK_AMOUNT, ASK_SELLER = range(2)
 
 ================= COMMANDS =================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE): kb = [["/newdeal", "/mydeals"], ["/help"]] await update.message.reply_text( "Welcome to Escrow Bot!\nCreate safe deals using USDT.", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), )
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE): kb = [["/newdeal", "/mydeals"], ["/help"]] if update.effective_user.id == ADMIN_ID: kb.append(["/admin"]) await update.message.reply_text( "Welcome to Escrow Bot!\nCreate safe deals using USDT.", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text( "Commands:\n" "/newdeal - Create a new deal\n" "/mydeals - View your deals\n" "(Admin only) /alldeals - List all deals\n" "(Admin only) /release <deal_id> - Release funds\n" "(Admin only) /refund <deal_id> - Refund buyer" )
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text( "Commands:\n" "/newdeal - Create a new deal\n" "/mydeals - View your deals\n" "(Admin only) /admin - Admin menu" )
 
 Start new deal
 
@@ -48,17 +49,23 @@ List user deals
 
 async def mydeals(update: Update, context: ContextTypes.DEFAULT_TYPE): uid = update.effective_user.id c.execute("SELECT id, seller_username, amount, status FROM deals WHERE buyer_id=?", (uid,)) deals = c.fetchall() if not deals: await update.message.reply_text("You have no deals yet.") else: msg = "Your deals:\n" for d in deals: msg += f"#{d[0]} - Seller: {d[1]}, Amount: {d[2]} USDT, Status: {d[3]}\n" await update.message.reply_text(msg)
 
-Admin: List all deals
+Admin Menu
 
-async def alldeals(update: Update, context: ContextTypes.DEFAULT_TYPE): if update.effective_user.id != ADMIN_ID: return c.execute("SELECT id, buyer_username, seller_username, amount, status FROM deals") deals = c.fetchall() if not deals: await update.message.reply_text("No deals in system.") else: msg = "All deals:\n" for d in deals: msg += f"#{d[0]} - Buyer: @{d[1]}, Seller: {d[2]}, Amount: {d[3]} USDT, Status: {d[4]}\n" await update.message.reply_text(msg)
+async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE): if update.effective_user.id != ADMIN_ID: return c.execute("SELECT id, buyer_username, seller_username, amount, status FROM deals") deals = c.fetchall() if not deals: await update.message.reply_text("No deals in system.") else: for d in deals: buttons = [ [ InlineKeyboardButton(f"✅ Release #{d[0]}", callback_data=f"release_{d[0]}"), InlineKeyboardButton(f"🔄 Refund #{d[0]}", callback_data=f"refund_{d[0]}"), ] ] msg = ( f"Deal #{d[0]}\n" f"Buyer: @{d[1]}\nSeller: {d[2]}\nAmount: {d[3]} USDT\nStatus: {d[4]}" ) await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(buttons))
 
-Admin: Release funds
+Callback for admin buttons
 
-async def release(update: Update, context: ContextTypes.DEFAULT_TYPE): if update.effective_user.id != ADMIN_ID: return try: deal_id = int(context.args[0]) c.execute("UPDATE deals SET status=? WHERE id=?", ("released", deal_id)) conn.commit() await update.message.reply_text(f"✅ Deal #{deal_id} marked as released. Pay seller manually.") except: await update.message.reply_text("Usage: /release <deal_id>")
+async def admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE): query = update.callback_query await query.answer() action, deal_id = query.data.split("_") deal_id = int(deal_id)
 
-Admin: Refund
+if action == "release":
+    c.execute("UPDATE deals SET status=? WHERE id=?", ("released", deal_id))
+    conn.commit()
+    await query.edit_message_text(f"✅ Deal #{deal_id} marked as released. Pay seller manually.")
 
-async def refund(update: Update, context: ContextTypes.DEFAULT_TYPE): if update.effective_user.id != ADMIN_ID: return try: deal_id = int(context.args[0]) c.execute("UPDATE deals SET status=? WHERE id=?", ("refunded", deal_id)) conn.commit() await update.message.reply_text(f"🔄 Deal #{deal_id} marked as refunded. Pay buyer manually.") except: await update.message.reply_text("Usage: /refund <deal_id>")
+elif action == "refund":
+    c.execute("UPDATE deals SET status=? WHERE id=?", ("refunded", deal_id))
+    conn.commit()
+    await query.edit_message_text(f"🔄 Deal #{deal_id} marked as refunded. Pay buyer manually.")
 
 ================= MAIN =================
 
@@ -77,9 +84,8 @@ app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("help", help_cmd))
 app.add_handler(conv)
 app.add_handler(CommandHandler("mydeals", mydeals))
-app.add_handler(CommandHandler("alldeals", alldeals))
-app.add_handler(CommandHandler("release", release))
-app.add_handler(CommandHandler("refund", refund))
+app.add_handler(CommandHandler("admin", admin_menu))
+app.add_handler(CallbackQueryHandler(admin_action))
 
 app.run_polling()
 
