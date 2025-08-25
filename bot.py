@@ -1,8 +1,8 @@
-import logging import sqlite3 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton from telegram.ext import ( Application, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, CallbackQueryHandler, filters, )
+import os import logging import sqlite3 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton from telegram.ext import ( Application, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, CallbackQueryHandler, filters, )
 
 ================= CONFIG =================
 
-BOT_TOKEN = "8051955868:AAFXhrj69_sNA2Riw-1qyQjVwG1dA2T6qHo" ADMIN_ID = 7357160729  # replace with your Telegram ID USDT_ADDRESS = "YOUR_USDT_ADDRESS"
+BOT_TOKEN = os.getenv("BOT_TOKEN") ADMIN_ID = int(os.getenv("ADMIN_ID")) USDT_ADDRESS = os.getenv("USDT_ADDRESS")
 
 DB setup
 
