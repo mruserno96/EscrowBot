@@ -1,549 +1,472 @@
-#!/usr/bin/env python3
 """
-Easy Escrow Bot — full single-file implementation.
-
-Requirements:
-  Python 3.10+
-  pip install python-telegram-bot==20.7
-
-Environment variables:
-  TG_TOKEN        - Telegram bot token
-  ADMIN_IDS       - comma-separated numeric Telegram IDs (e.g. 12345,67890)
-  USDT_ADDRESS    - your fixed USDT address (TRC20 or ERC20)
-  ESCROW_GROUP    - optional group invite link
-  ADMIN_CONTACT   - optional admin contact handle (e.g. @Admin)
+Manual Escrow Telegram Bot (Python, python-telegram-bot v20)
+Features:
+- /start message (exact formatting you provided)
+- /escrow (creates an escrow record and gives instructions + deep link to add bot to group)
+- After creating a group and adding the bot, run /initescrow <escrow_id> inside the group to bind it
+- Group welcome message (the exact wording you gave)
+- /dd message to ask for deal details
+- /buyer <address> and /seller <address>
+- /deposit <txid> to upload TXID (not verified on-chain; admin manually verifies)
+- Admin commands: /mark_received, /release, /cancel
+- /status, /dispute
+- SQLite storage
 """
-from __future__ import annotations
 
-import json
-import os
-import random
-import re
+import logging
 import sqlite3
-import string
+import uuid
+import html
 from datetime import datetime
-from typing import Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ChatPermissions,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-# -------------------- CONFIG --------------------
-TG_TOKEN = os.getenv("TG_TOKEN", "")
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-USDT_ADDRESS = os.getenv("USDT_ADDRESS", "TRC20_or_ERC20_wallet_address_here")
-ESCROW_GROUP = os.getenv("ESCROW_GROUP", "https://t.me/yourgroup")
-ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@YourAdmin")
+# ---------------- CONFIG - EDIT THESE BEFORE RUNNING ----------------
+import os
 
-DB_FILE = "escrow.db"
-SUPPORTED_TOKENS = ["USDT-TRC20", "USDT-ERC20", "USDC-ERC20", "ETH", "BTC"]
-DEFAULT_FEE_BPS = 100  # 1%
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID"))
+USDT_BEP20_ADDRESS = os.getenv("USDT_BEP20_ADDRESS")
+BOT_USERNAME = "Easy_Escroww_Bot"   # without @
+ESCROW_FEE_PERCENT = 1.0  # flat percent shown to users
+# ---------------------------------------------------------------------
 
-# quick guard
-if not TG_TOKEN:
-    raise SystemExit("TG_TOKEN environment variable is required")
+# Logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# -------------------- DB HELPERS --------------------
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+# DB helper
+DB_PATH = "escrow_bot.db"
 
-def init_db() -> None:
-    conn = db()
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.executescript(
+    cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS users (
-          id INTEGER PRIMARY KEY,
-          username TEXT,
-          first_name TEXT,
-          referrals INTEGER DEFAULT 0,
-          referred_by INTEGER,
-          saved_json TEXT DEFAULT '{}',
-          created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS deals (
-          id TEXT PRIMARY KEY,
-          chat_id INTEGER,
-          creator_id INTEGER,
-          buyer_id INTEGER,
-          seller_id INTEGER,
-          token TEXT,
-          amount REAL,
-          fee_bps INTEGER,
-          status TEXT,
-          deposit_address TEXT,
-          balance REAL DEFAULT 0,
-          details_json TEXT DEFAULT '{}',
-          created_at TEXT,
-          updated_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS vouches (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_id INTEGER,
-          text TEXT,
-          created_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS disputes (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          deal_id TEXT,
-          raised_by INTEGER,
-          reason TEXT,
-          status TEXT,
-          created_at TEXT
-        );
-        """
+    CREATE TABLE IF NOT EXISTS escrows (
+        id TEXT PRIMARY KEY,
+        creator_id INTEGER,
+        creator_name TEXT,
+        amount TEXT,
+        rate TEXT,
+        conditions TEXT,
+        buyer_address TEXT,
+        seller_address TEXT,
+        txid TEXT,
+        status TEXT,
+        created_at TEXT,
+        group_id INTEGER,
+        group_invite_link TEXT
+    )
+    """
     )
     conn.commit()
     conn.close()
 
-def now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
-
-def new_deal_id() -> str:
-    return "DL-" + "".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(8))
-
-# -------------------- UTILS --------------------
-def is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS
-
-def verify_address_format(token: str, address: str) -> bool:
-    token = token.upper()
-    if token.endswith("ERC20") or token == "ETH":
-        return bool(re.fullmatch(r"0x[a-fA-F0-9]{24,64}", address))
-    if token.startswith("USDT-TRC20") or token == "TRX":
-        return bool(re.fullmatch(r"T[1-9A-HJ-NP-Za-km-z]{24,50}", address))
-    if token == "BTC":
-        return bool(re.fullmatch(r"(bc1|[13])[a-zA-HJ-NP-Z0-9]{20,59}", address))
-    return False
-
-# -------------------- DB OPERATIONS --------------------
-def upsert_user(user, referred_by: Optional[int] = None) -> None:
-    conn = db(); cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO users (id, username, first_name, created_at) VALUES (?, ?, ?, ?)",
-                (user.id, user.username or "", user.first_name or "", now_iso()))
-    cur.execute("UPDATE users SET username=?, first_name=? WHERE id=?",
-                (user.username or "", user.first_name or "", user.id))
-    if referred_by and referred_by != user.id:
-        cur.execute("SELECT referred_by FROM users WHERE id=?", (user.id,))
-        row = cur.fetchone()
-        if row and row["referred_by"] is None:
-            cur.execute("UPDATE users SET referred_by=? WHERE id=?", (referred_by, user.id))
-            cur.execute("UPDATE users SET referrals = COALESCE(referrals,0)+1 WHERE id=?", (referred_by,))
-    conn.commit(); conn.close()
-
-def create_deal(chat_id: int, creator_id: int) -> str:
-    deal_id = new_deal_id()
-    conn = db(); cur = conn.cursor()
+def create_escrow_record(creator_id, creator_name):
+    escrow_id = str(uuid.uuid4())[:8]
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
     cur.execute(
-        "INSERT INTO deals (id, chat_id, creator_id, status, deposit_address, fee_bps, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (deal_id, chat_id, creator_id, "NEW", USDT_ADDRESS, DEFAULT_FEE_BPS, now_iso(), now_iso())
+        "INSERT INTO escrows (id, creator_id, creator_name, status, created_at) VALUES (?, ?, ?, ?, ?)",
+        (escrow_id, creator_id, creator_name, "created", datetime.utcnow().isoformat()),
     )
-    conn.commit(); conn.close()
-    return deal_id
-
-def get_latest_deal(chat_id: int):
-    conn = db(); cur = conn.cursor()
-    cur.execute("SELECT * FROM deals WHERE chat_id=? ORDER BY created_at DESC LIMIT 1", (chat_id,))
-    row = cur.fetchone(); conn.close(); return row
-
-def get_deal_by_id(deal_id: str):
-    conn = db(); cur = conn.cursor()
-    cur.execute("SELECT * FROM deals WHERE id=?", (deal_id,))
-    row = cur.fetchone(); conn.close(); return row
-
-def update_deal(deal_id: str, **fields):
-    if not fields:
-        return
-    fields["updated_at"] = now_iso()
-    conn = db(); cur = conn.cursor()
-    sets = ",".join([f"{k}=?" for k in fields.keys()])
-    cur.execute(f"UPDATE deals SET {sets} WHERE id=?", (*fields.values(), deal_id))
-    conn.commit(); conn.close()
-
-# -------------------- UI --------------------
-MAIN_MENU = InlineKeyboardMarkup([
-    [InlineKeyboardButton("➕ New Deal", callback_data="menu:newdeal"), InlineKeyboardButton("📜 Terms", callback_data="menu:terms")],
-    [InlineKeyboardButton("📚 What is Escrow?", callback_data="menu:whatisescrow")],
-    [InlineKeyboardButton("⚙️ Commands", callback_data="menu:commands"), InlineKeyboardButton("📊 Stats", callback_data="menu:stats")]
-])
-
-TOKEN_MENU = InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=f"token:{t}")] for t in SUPPORTED_TOKENS])
-
-# -------------------- HANDLERS --------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # supports referral: /start ref-<id>
-    ref_by = None
-    if context.args:
-        m = re.fullmatch(r"ref-(\d+)", context.args[0])
-        if m:
-            ref_by = int(m.group(1))
-    upsert_user(update.effective_user, referred_by=ref_by)
-    await update.message.reply_text(
-        "👋 Welcome to Easy Escrow Bot!\nUse /commands to view features.",
-        reply_markup=MAIN_MENU
-    )
-
-async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-    data = update.callback_query.data
-    if data == "menu:newdeal":
-        await newdeal(update, context)
-    elif data == "menu:terms":
-        await terms(update, context)
-    elif data == "menu:whatisescrow":
-        await whatis(update, context)
-    elif data == "menu:commands":
-        await commands_cmd(update, context)
-    elif data == "menu:stats":
-        await stats(update, context)
-    elif data.startswith("token:"):
-        await token_cmd(update, context)
-
-async def whatis(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "🔐 Escrow holds funds until both parties fulfil the deal.\nFlow: /newdeal → set parties → /token → /dd → /deposit → admin confirms → /release"
-    )
-
-async def instructions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "📘 How to use:\n1) /newdeal\n2) /seller and /buyer\n3) /token (choose)\n4) /dd amount:100 item:Info\n5) /deposit to see address\n6) Admin uses /confirmfund <amount>\n7) Admin /release or /refund"
-    )
-
-async def terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "📄 Terms: This bot coordinates escrow records. Funds are controlled by admin wallet. Admin decisions are final."
-    )
-
-async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "📌 AVAILABLE COMMANDS\n"
-        "/start\n/whatisescrow\n/instructions\n/terms\n/dispute\n/menu\n/contact\n/commands\n/stats\n/vouch\n"
-        "/newdeal\n/tradeid\n/dd\n/escrow\n/token\n/deposit\n/verify\n/balance\n/release\n/refund\n/seller\n/buyer\n/setfee\n/save\n/saved\n/referral\n/confirmfund\n"
-    )
-    await update.effective_message.reply_text(msg)
-
-async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(f"📮 Admin contact: {ADMIN_CONTACT}")
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = db(); cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) c FROM deals"); total = cur.fetchone()["c"]
-    cur.execute("SELECT COUNT(*) c FROM deals WHERE status='RELEASED'"); rel = cur.fetchone()["c"]
-    cur.execute("SELECT COUNT(*) c FROM deals WHERE status='REFUNDED'"); ref = cur.fetchone()["c"]
-    cur.execute("SELECT COUNT(*) c FROM disputes WHERE status='OPEN'"); dis = cur.fetchone()["c"]
+    conn.commit()
     conn.close()
-    await update.effective_message.reply_text(f"📊 Total deals: {total}\nReleased: {rel}\nRefunded: {ref}\nOpen disputes: {dis}")
+    return escrow_id
 
-async def vouch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(context.args) if context.args else ""
-    if not text:
-        await update.effective_message.reply_text("Usage: /vouch I had a great trade because ...")
-        return
-    conn = db(); cur = conn.cursor()
-    cur.execute("INSERT INTO vouches (user_id, text, created_at) VALUES (?, ?, ?)",
-                (update.effective_user.id, text, now_iso()))
-    conn.commit(); conn.close()
-    await update.effective_message.reply_text("🙏 Thanks — your vouch was saved.")
+def get_escrow(escrow_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM escrows WHERE id = ?", (escrow_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
 
-# ---- Deals ----
-async def newdeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    creator = update.effective_user.id
-    deal_id = create_deal(chat_id, creator)
-    await update.effective_message.reply_text(f"🆕 New deal created: <b>{deal_id}</b>\nUse /seller and /buyer to set parties, /token to set token and /dd for details.",
-                                             parse_mode="HTML")
+def update_escrow(escrow_id, field, value):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    sql = f"UPDATE escrows SET {field} = ? WHERE id = ?"
+    cur.execute(sql, (value, escrow_id))
+    conn.commit()
+    conn.close()
 
-async def tradeid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    row = get_latest_deal(update.effective_chat.id)
-    if not row:
-        await update.effective_message.reply_text("No active deal. Start one with /newdeal")
-        return
-    await update.effective_message.reply_text(f"🔖 Current Trade ID: <b>{row['id']}</b>", parse_mode="HTML")
+def find_escrow_by_group(group_id):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM escrows WHERE group_id = ?", (group_id,))
+    r = cur.fetchone()
+    conn.close()
+    return r
 
-async def dd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    row = get_latest_deal(update.effective_chat.id)
-    if not row:
-        await update.effective_message.reply_text("Start a deal first with /newdeal")
-        return
-    raw = update.effective_message.text.replace("/dd", "", 1).strip()
-    if not raw:
-        await update.effective_message.reply_text("Usage: /dd amount:100 item:Description deadline:2025-09-01")
-        return
-    details = json.loads(row["details_json"]) if row["details_json"] else {}
-    for chunk in re.findall(r"(\w+:[^\s]+)", raw):
-        k, v = chunk.split(":", 1)
-        details[k.lower()] = v
-        if k.lower() == "amount":
-            try:
-                update_deal(row["id"], amount=float(v))
-            except Exception:
-                pass
-    update_deal(row["id"], details_json=json.dumps(details))
-    await update.effective_message.reply_text(f"✅ Deal details updated: {details}")
+# ---------------- Messages (exact text + small polishing) ----------------
+
+START_TEXT = f"""💫 @{BOT_USERNAME} 💫
+Your Trustworthy Telegram Escrow Service
+
+Welcome to @{BOT_USERNAME}. This bot provides a reliable escrow service for your transactions on Telegram.
+
+Avoid scams, your funds are safeguarded throughout your deals. If you run into any issues, simply type /dispute and an arbitrator will join the group chat within 24 hours.
+
+🎟 ESCROW FEE: {ESCROW_FEE_PERCENT:.1f}% Flat
+🌐 (UPDATES) - (VOUCHES) ☑️
+
+💬 Proceed with /escrow (to start with a new escrow)
+
+⚠️ IMPORTANT - Make sure coin is same of Buyer and Seller else you may loose your coin.
+
+💡 Type /menu to summon a menu with all bot's features
+"""
+
+ESCROW_CREATED_TEXT = """Creating a safe trading place for you... please wait...
+Escrow Group Created
+
+Creator: {creator}
+
+Join this escrow group and share the link with the buyer and seller:
+
+{invite_link}
+
+⚠️ Note: This link is for 2 members only — third parties are not allowed to join.
+"""
+
+GROUP_WELCOME = """📍 Hey there traders! Welcome to our escrow service.
+⚠️ IMPORTANT - Make sure coin and network is same of Buyer and Seller else you may loose your coin.
+⚠️ IMPORTANT - Make sure the /buyer address and /seller address are of same chain else you may loose your coin.
+✅ Please start with /dd command and if you have any doubts please use /start command.
+"""
+
+DD_TEXT = """/dd
+Hello there,
+Kindly tell deal details i.e.
+Quantity - Rate - Conditions (if any)
+Remember: without it disputes wouldn’t be resolved.
+
+Once filled, proceed with specifications of the seller or buyer using:
+/seller  [CRYPTO ADDRESS]
+/buyer   [CRYPTO ADDRESS]
+"""
+
+MENU_TEXT = """Available commands:
+/escrow - Create a new escrow (private group)
+/menu - Show this menu
+/start - Main info
+/dispute - Request arbitration (notifies admin)
+/status <escrow_id> - Check escrow status (admin or group)
+/deposit <txid> - Buyer reports TXID (admin will manually verify)
+/buyer <address> - Buyer sets their address
+/seller <address> - Seller sets their address
+"""
+
+# ---------------- Handlers ----------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(START_TEXT, parse_mode="HTML")
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(MENU_TEXT)
 
 async def escrow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(f"🔗 Escrow group: {ESCROW_GROUP}")
+    user = update.effective_user
+    creator_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+    escrow_id = create_escrow_record(user.id, creator_name)
+    # Provide deep-link to add bot to a new group
+    deep_link = f"https://t.me/{BOT_USERNAME}?startgroup={escrow_id}"
+    text = ESCROW_CREATED_TEXT.format(creator=html.escape(creator_name), invite_link=deep_link)
+    await update.message.reply_text(text, parse_mode="HTML")
+    await update.message.reply_text("After creating the group and adding the other party, open the new group and run:\n"
+                                    f"/initescrow {escrow_id}\n\n"
+                                    "This will bind the group to the escrow and post the welcome message.")
 
-async def token_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # supports both callback and /token <TOKEN>
-    if context.args:
-        chosen = context.args[0].upper()
-        if chosen not in SUPPORTED_TOKENS:
-            await update.effective_message.reply_text(f"Unsupported token. Choose: {', '.join(SUPPORTED_TOKENS)}")
-            return
-        row = get_latest_deal(update.effective_chat.id)
-        if not row:
-            await update.effective_message.reply_text("Start a deal first with /newdeal")
-            return
-        update_deal(row["id"], token=chosen)
-        await update.effective_message.reply_text(f"✅ Token set to {chosen}")
+async def initescrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # This command must be used inside the group after bot is added
+    if update.effective_chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Please use /initescrow <escrow_id> inside the newly created escrow GROUP.")
         return
-    await update.effective_message.reply_text("Choose token:", reply_markup=TOKEN_MENU)
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /initescrow <escrow_id>")
+        return
+    escrow_id = args[0]
+    escrow = get_escrow(escrow_id)
+    if not escrow:
+        await update.message.reply_text("Escrow ID not found. Make sure you used the same ID shown when you ran /escrow.")
+        return
+    group_id = update.effective_chat.id
+    # Bind
+    update_escrow(escrow_id, "group_id", group_id)
+    update_escrow(escrow_id, "group_invite_link", f"https://t.me/joinchat/{str(uuid.uuid4())[:22]}")
+    update_escrow(escrow_id, "status", "waiting_deposit")
+    await update.message.reply_text(GROUP_WELCOME)
+    await update.message.reply_text("Escrow initialized. Please use /dd to enter deal details.")
 
-async def deposit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    row = get_latest_deal(update.effective_chat.id)
-    if not row:
-        await update.effective_message.reply_text("Start a deal first with /newdeal")
+async def dd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Only in group
+    if update.effective_chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Please run /dd inside the escrow group.")
         return
-    if row["status"] == "NEW":
-        update_deal(row["id"], status="AWAITING_DEPOSIT")
-    await update.effective_message.reply_text(
-        f"💳 Send the agreed USDT to this address (admin wallet):\n<code>{USDT_ADDRESS}</code>\n\nTrade ID: <b>{row['id']}</b>\nAfter sending, notify admin and provide TXID.",
-        parse_mode="HTML"
+    await update.message.reply_text(DD_TEXT)
+
+async def buyer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Please set buyer address inside the escrow group using /buyer <address>")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /buyer <CRYPTO ADDRESS>")
+        return
+    address = context.args[0]
+    group_id = update.effective_chat.id
+    escrow = find_escrow_by_group(group_id)
+    if not escrow:
+        await update.message.reply_text("This group is not linked to any escrow. Use /initescrow <escrow_id> first.")
+        return
+    escrow_id = escrow[0]
+    update_escrow(escrow_id, "buyer_address", address)
+    await update.message.reply_text(f"Buyer address saved: {address}\nMake sure buyer and seller use the same chain.")
+
+async def seller_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Please set seller address inside the escrow group using /seller <address>")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /seller <CRYPTO ADDRESS>")
+        return
+    address = context.args[0]
+    group_id = update.effective_chat.id
+    escrow = find_escrow_by_group(group_id)
+    if not escrow:
+        await update.message.reply_text("This group is not linked to any escrow. Use /initescrow <escrow_id> first.")
+        return
+    escrow_id = escrow[0]
+    update_escrow(escrow_id, "seller_address", address)
+    await update.message.reply_text(f"Seller address saved: {address}\nMake sure buyer and seller use the same chain.")
+
+async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # deposit TXID reported in group
+    if not context.args:
+        await update.message.reply_text("Usage: /deposit <TXID>")
+        return
+    txid = context.args[0]
+    # If used in group, bind to group escrow. If private, require escrow id.
+    if update.effective_chat.type in ("group", "supergroup"):
+        escrow = find_escrow_by_group(update.effective_chat.id)
+        if not escrow:
+            await update.message.reply_text("No escrow linked to this group. Use /initescrow <escrow_id> first.")
+            return
+        escrow_id = escrow[0]
+    else:
+        # private chat: expect escrow id first arg and txid second
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage in private chat: /deposit <escrow_id> <TXID>")
+            return
+        escrow_id = context.args[0]
+        txid = context.args[1]
+        escrow = get_escrow(escrow_id)
+        if not escrow:
+            await update.message.reply_text("Escrow ID not found.")
+            return
+    update_escrow(escrow_id, "txid", txid)
+    update_escrow(escrow_id, "status", "tx_submitted")
+    await update.message.reply_text("TXID saved. Admin will manually verify and mark as received when confirmed.")
+    # notify admin
+    notify_admin_text = f"🔔 New deposit reported\nEscrow: {escrow_id}\nTXID: {txid}\nCheck and /mark_received {escrow_id} when you confirm."
+    try:
+        await context.bot.send_message(OWNER_ID, notify_admin_text)
+    except Exception as e:
+        logger.error("Failed to notify admin: %s", e)
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /status <escrow_id>  OR in group
+    if update.effective_chat.type in ("group", "supergroup"):
+        escrow = find_escrow_by_group(update.effective_chat.id)
+        if not escrow:
+            await update.message.reply_text("No escrow bound to this group.")
+            return
+        escrow_id = escrow[0]
+    else:
+        if not context.args:
+            await update.message.reply_text("Usage: /status <escrow_id>")
+            return
+        escrow_id = context.args[0]
+    e = get_escrow(escrow_id)
+    if not e:
+        await update.message.reply_text("Escrow not found.")
+        return
+    # unpack fields
+    (eid, creator_id, creator_name, amount, rate, conditions, buyer_addr, seller_addr, txid, status, created_at, group_id, group_link) = e
+    reply = (
+        f"Escrow {eid}\n"
+        f"Creator: {creator_name} ({creator_id})\n"
+        f"Amount: {amount or '—'}\n"
+        f"Rate: {rate or '—'}\n"
+        f"Conditions: {conditions or '—'}\n"
+        f"Buyer: {buyer_addr or '—'}\n"
+        f"Seller: {seller_addr or '—'}\n"
+        f"TXID: {txid or '—'}\n"
+        f"Status: {status}\n"
+        f"Group: {group_id or '—'}\n"
+        f"Created at (UTC): {created_at}"
     )
+    await update.message.reply_text(reply)
 
-async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.effective_message.reply_text("Usage: /verify <TOKEN> <ADDRESS>")
-        return
-    token = context.args[0]
-    address = context.args[1]
-    ok = verify_address_format(token, address)
-    await update.effective_message.reply_text("✅ Address format looks valid." if ok else "❌ Address format looks invalid.")
+# Admin-only command helpers
+def is_admin(user_id):
+    return user_id == OWNER_ID
 
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    row = get_latest_deal(update.effective_chat.id)
-    if not row:
-        await update.effective_message.reply_text("No active deal.")
-        return
-    await update.effective_message.reply_text(f"Balance for {row['id']}: {row['balance']} {row['token'] or 'USDT'} (status: {row['status']})")
-
-# ---- Parties ----
-async def seller(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    row = get_latest_deal(update.effective_chat.id)
-    if not row:
-        await update.effective_message.reply_text("Start a deal first.")
+async def mark_received_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Only admin can use this command.")
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /seller <telegram_user_id> or /seller @username (id recommended)")
+        await update.message.reply_text("Usage: /mark_received <escrow_id>")
         return
-    arg = context.args[0].lstrip("@")
-    try:
-        seller_id = int(arg)
-    except ValueError:
-        seller_id = None
-    update_deal(row["id"], seller_id=seller_id)
-    await update.effective_message.reply_text("✅ Seller set.")
-
-async def buyer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    row = get_latest_deal(update.effective_chat.id)
-    if not row:
-        await update.effective_message.reply_text("Start a deal first.")
+    escrow_id = context.args[0]
+    e = get_escrow(escrow_id)
+    if not e:
+        await update.message.reply_text("Escrow not found.")
         return
-    if not context.args:
-        await update.effective_message.reply_text("Usage: /buyer <telegram_user_id> or /buyer @username (id recommended)")
-        return
-    arg = context.args[0].lstrip("@")
-    try:
-        buyer_id = int(arg)
-    except ValueError:
-        buyer_id = None
-    update_deal(row["id"], buyer_id=buyer_id)
-    await update.effective_message.reply_text("✅ Buyer set.")
-
-# ---- Fees & saved addresses ----
-async def setfee(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text("Only admins can set fees.")
-        return
-    if not context.args:
-        await update.effective_message.reply_text("Usage: /setfee <basis_points> (100 = 1%)")
-        return
-    try:
-        bps = int(context.args[0])
-    except ValueError:
-        await update.effective_message.reply_text("Enter a number, e.g., 100")
-        return
-    row = get_latest_deal(update.effective_chat.id)
-    if not row:
-        await update.effective_message.reply_text("No deal in this chat.")
-        return
-    update_deal(row["id"], fee_bps=bps)
-    await update.effective_message.reply_text(f"✅ Fee set to {bps} bps")
-
-async def save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.effective_message.reply_text("Usage: /save <CHAIN> <ADDRESS>")
-        return
-    chain = context.args[0].upper()
-    addr = context.args[1]
-    conn = db(); cur = conn.cursor()
-    cur.execute("SELECT saved_json FROM users WHERE id=?", (update.effective_user.id,))
-    row = cur.fetchone()
-    saved = json.loads(row["saved_json"]) if row and row["saved_json"] else {}
-    saved[chain] = addr
-    cur.execute("UPDATE users SET saved_json=? WHERE id=?", (json.dumps(saved), update.effective_user.id))
-    conn.commit(); conn.close()
-    await update.effective_message.reply_text(f"✅ Saved {chain} address.")
-
-async def saved_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = db(); cur = conn.cursor()
-    cur.execute("SELECT saved_json FROM users WHERE id=?", (update.effective_user.id,))
-    row = cur.fetchone(); conn.close()
-    saved = json.loads(row["saved_json"]) if row and row["saved_json"] else {}
-    if not saved:
-        await update.effective_message.reply_text("No saved addresses.")
-        return
-    pretty = "\n".join(f"• {k}: {v}" for k, v in saved.items())
-    await update.effective_message.reply_text(f"Saved addresses:\n{pretty}")
-
-async def referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    code = f"ref-{update.effective_user.id}"
-    conn = db(); cur = conn.cursor()
-    cur.execute("SELECT referrals FROM users WHERE id=?", (update.effective_user.id,))
-    row = cur.fetchone(); conn.close()
-    refs = row["referrals"] if row else 0
-    await update.effective_message.reply_text(f"Your referral code: {code}\nReferrals: {refs}")
-
-# ---- Disputes ----
-async def dispute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    row = get_latest_deal(update.effective_chat.id)
-    reason = " ".join(context.args) if context.args else "(no details)"
-    conn = db(); cur = conn.cursor()
-    cur.execute("INSERT INTO disputes (deal_id, raised_by, reason, status, created_at) VALUES (?, ?, ?, ?, ?)",
-                (row["id"] if row else None, update.effective_user.id, reason, "OPEN", now_iso()))
-    conn.commit(); conn.close()
-    # notify admins
-    for aid in ADMIN_IDS:
+    update_escrow(escrow_id, "status", "funds_received")
+    await update.message.reply_text(f"Escrow {escrow_id} marked as funds received.")
+    # notify group
+    group_id = e[11]
+    if group_id:
         try:
-            await context.bot.send_message(aid, f"🚩 Dispute opened for deal {row['id'] if row else '(none)'} by {update.effective_user.id}\nReason: {reason}")
+            await context.bot.send_message(group_id, f"Admin has marked funds as received for escrow {escrow_id}.")
         except Exception:
             pass
-    await update.effective_message.reply_text("✅ Dispute recorded. Admins notified.")
 
-# ---- Admin: confirm funds, release, refund ----
-async def confirmfund(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text("Admins only.")
+async def release_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Only admin can release funds.")
         return
     if not context.args:
-        await update.effective_message.reply_text("Usage: /confirmfund <amount>")
+        await update.message.reply_text("Usage: /release <escrow_id>")
         return
+    escrow_id = context.args[0]
+    e = get_escrow(escrow_id)
+    if not e:
+        await update.message.reply_text("Escrow not found.")
+        return
+    # In manual flow, releasing means admin has sent USDT from their address to seller. We just mark state.
+    update_escrow(escrow_id, "status", "released")
+    await update.message.reply_text(f"Escrow {escrow_id} marked as RELEASED.")
+    # notify group
+    group_id = e[11]
+    if group_id:
+        try:
+            await context.bot.send_message(group_id, f"Admin has RELEASED funds for escrow {escrow_id}. Thank you for using the service.")
+        except Exception:
+            pass
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Only admin can cancel an escrow.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /cancel <escrow_id>")
+        return
+    escrow_id = context.args[0]
+    e = get_escrow(escrow_id)
+    if not e:
+        await update.message.reply_text("Escrow not found.")
+        return
+    update_escrow(escrow_id, "status", "cancelled")
+    await update.message.reply_text(f"Escrow {escrow_id} cancelled.")
+    group_id = e[11]
+    if group_id:
+        try:
+            await context.bot.send_message(group_id, f"Escrow {escrow_id} has been cancelled by admin.")
+        except Exception:
+            pass
+
+async def dispute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Notify admin to join group as arbitrator
+    if update.effective_chat.type in ("group", "supergroup"):
+        escrow = find_escrow_by_group(update.effective_chat.id)
+        group_id = update.effective_chat.id
+        group_title = update.effective_chat.title or "Escrow Group"
+        if escrow:
+            escrow_id = escrow[0]
+        else:
+            escrow_id = "—"
+        text = f"⚠️ Dispute requested in group {group_title} (id {group_id})\nEscrow: {escrow_id}\nPlease join the group to arbitrate."
+        await update.message.reply_text("Dispute noted. An arbitrator will be notified.")
+    else:
+        text = f"⚠️ Dispute requested by user {update.effective_user.id} in private chat."
+        await update.message.reply_text("Dispute noted. Admin will be notified.")
     try:
-        amt = float(context.args[0])
-    except ValueError:
-        await update.effective_message.reply_text("Enter a numeric amount.")
-        return
-    row = get_latest_deal(update.effective_chat.id)
-    if not row:
-        await update.effective_message.reply_text("No deal in this chat.")
-        return
-    new_bal = (row["balance"] or 0.0) + amt
-    update_deal(row["id"], balance=new_bal, status="FUNDED")
-    await update.effective_message.reply_text(f"✅ Marked funded: {amt}. New balance: {new_bal} (deal {row['id']})")
+        await context.bot.send_message(OWNER_ID, text)
+    except Exception as e:
+        logger.error("Failed to notify admin for dispute: %s", e)
 
-async def release(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text("Admins only.")
-        return
-    if not context.args:
-        await update.effective_message.reply_text("Usage: /release <deal_id>")
-        return
-    deal_id = context.args[0]
-    d = get_deal_by_id(deal_id)
-    if not d:
-        await update.effective_message.reply_text("Deal not found.")
-        return
-    if (d["balance"] or 0) <= 0:
-        await update.effective_message.reply_text("No funds recorded for this deal.")
-        return
-    update_deal(deal_id, status="RELEASED")
-    await update.effective_message.reply_text(f"✅ Deal {deal_id} set to RELEASED. (Please pay seller from your wallet)")
+# Utility to show deposit address
+async def deposit_address_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        f"Our fixed USDT BEP20 deposit address (use BEP20 / BSC network):\n\n"
+        f"`{USDT_BEP20_ADDRESS}`\n\n"
+        "Make sure buyer sends EXACTLY USDT BEP20 to this address. After sending, report the TXID with /deposit <TXID>."
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
 
-async def refund(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text("Admins only.")
-        return
-    if not context.args:
-        await update.effective_message.reply_text("Usage: /refund <deal_id>")
-        return
-    deal_id = context.args[0]
-    d = get_deal_by_id(deal_id)
-    if not d:
-        await update.effective_message.reply_text("Deal not found.")
-        return
-    if (d["balance"] or 0) <= 0:
-        await update.effective_message.reply_text("No funds recorded for this deal.")
-        return
-    update_deal(deal_id, status="REFUNDED")
-    await update.effective_message.reply_text(f"✅ Deal {deal_id} set to REFUNDED. (Please refund buyer from your wallet)")
+# welcome new members (optional)
+async def new_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # if bot added to group, give small tip message
+    for member in update.message.new_chat_members:
+        if member.is_bot and member.username == BOT_USERNAME:
+            await update.message.reply_text("Hello! I'm the escrow bot. To finish setup, run /initescrow <escrow_id> (the ID shown when you used /escrow).")
 
-# Error handler
-async def on_error(update_obj, context: ContextTypes.DEFAULT_TYPE):
-    print("ERROR:", context.error)
-    try:
-        if update_obj and getattr(update_obj, "effective_message", None):
-            await update_obj.effective_message.reply_text("⚠️ An error occurred. Please try again.")
-    except Exception:
-        pass
+# generic unknown command handler
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Unknown command. Type /menu to see available commands.")
 
-# -------------------- BOOT --------------------
+# ---------------- Main application ----------------
+
 def main():
     init_db()
-    app = ApplicationBuilder().token(TG_TOKEN).build()
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Public
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_router))
-    app.add_handler(CommandHandler("whatisescrow", whatis))
-    app.add_handler(CommandHandler("instructions", instructions))
-    app.add_handler(CommandHandler("terms", terms))
-    app.add_handler(CommandHandler("menu", lambda u,c: u.message.reply_text("Main menu:", reply_markup=MAIN_MENU)))
-    app.add_handler(CommandHandler("contact", contact))
-    app.add_handler(CommandHandler("commands", commands_cmd))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("vouch", vouch))
+    # public commands
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("menu", menu))
+    application.add_handler(CommandHandler("escrow", escrow_cmd))
+    application.add_handler(CommandHandler("initescrow", initescrow))
+    application.add_handler(CommandHandler("dd", dd_cmd))
+    application.add_handler(CommandHandler("buyer", buyer_cmd))
+    application.add_handler(CommandHandler("seller", seller_cmd))
+    application.add_handler(CommandHandler("deposit", deposit_cmd))
+    application.add_handler(CommandHandler("status", status_cmd))
+    application.add_handler(CommandHandler("dispute", dispute_cmd))
+    application.add_handler(CommandHandler("address", deposit_address_cmd))
+    # admin
+    application.add_handler(CommandHandler("mark_received", mark_received_cmd))
+    application.add_handler(CommandHandler("release", release_cmd))
+    application.add_handler(CommandHandler("cancel", cancel_cmd))
 
-    # Deals
-    app.add_handler(CommandHandler("newdeal", newdeal))
-    app.add_handler(CommandHandler("tradeid", tradeid))
-    app.add_handler(CommandHandler("dd", dd))
-    app.add_handler(CommandHandler("escrow", escrow_cmd))
-    app.add_handler(CommandHandler("token", token_cmd))
-    app.add_handler(CommandHandler("deposit", deposit))
-    app.add_handler(CommandHandler("verify", verify))
-    app.add_handler(CommandHandler("balance", balance))
+    # welcome handler
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_chat_member))
 
-    # Parties & config
-    app.add_handler(CommandHandler("seller", seller))
-    app.add_handler(CommandHandler("buyer", buyer))
-    app.add_handler(CommandHandler("setfee", setfee))
-    app.add_handler(CommandHandler("save", save))
-    app.add_handler(CommandHandler("saved", saved_cmd))
-    app.add_handler(CommandHandler("referral", referral))
-    app.add_handler(CommandHandler("dispute", dispute))
+    # unknown
+    application.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    # Admin: fund confirm & payouts
-    app.add_handler(CommandHandler("confirmfund", confirmfund))
-    app.add_handler(CommandHandler("release", release))
-    app.add_handler(CommandHandler("refund", refund))
-
-    app.add_error_handler(on_error)
-
-    print("Easy Escrow Bot — running (long polling)...")
-    app.run_polling()
+    logger.info("Starting bot...")
+    application.run_polling(allowed_updates=["message", "edited_message", "chat_member", "my_chat_member"])
 
 if __name__ == "__main__":
     main()
-    
